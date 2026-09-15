@@ -1,0 +1,46 @@
+// Execute with node tests/service.cjs. Real SQLite, stubbed identity/storage/payment network.
+const fs=require('node:fs'),vm=require('node:vm'),path=require('node:path'),assert=require('node:assert/strict'),ts=require('typescript'),{DatabaseSync}=require('node:sqlite'),{webcrypto,createHmac}=require('node:crypto');
+const sql=new DatabaseSync(':memory:');
+sql.exec(fs.readFileSync('drizzle/0000_orange_polaris.sql','utf8'));
+const DB={prepare(query){let values=[];return{bind(...v){values=v;return this},async first(){return sql.prepare(query).get(...values)||null},async all(){return{results:sql.prepare(query).all(...values)}},async run(){const r=sql.prepare(query).run(...values);return{meta:{changes:Number(r.changes)}}}}},async batch(statements){sql.exec('BEGIN');try{const r=[];for(const s of statements)r.push(await s.run());sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}}};
+let identity=null;const objects=new Map();
+const env={DB,BUCKET:{async put(k,b){objects.set(k,b)},async get(k){return objects.has(k)?{body:objects.get(k)}:null},async delete(k){objects.delete(k)}},ADMIN_EMAIL:'owner@example.com',RAZORPAY_KEY_ID:'rzp_live_fixture',RAZORPAY_KEY_SECRET:'fixture-secret',RAZORPAY_WEBHOOK_SECRET:'fixture-webhook'};
+let payment={id:'pay_fixture',order_id:'order_fixture',amount:29900,currency:'INR',status:'captured'};
+let orderCreates=0;
+async function provider(url,options){if(url.endsWith('/orders')&&options.method==='POST'){orderCreates++;const input=JSON.parse(options.body);return Response.json({id:'order_fixture',...input});}if(url.endsWith('/payments/pay_fixture'))return Response.json(payment);if(url.endsWith('/orders/order_fixture/payments'))return Response.json({items:[payment]});throw new Error('Unexpected provider call '+url);}
+const cache={};function load(file){if(cache[file])return cache[file];const source=ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;const module={exports:{}};const sandbox={module,exports:module.exports,require(name){if(name==='cloudflare:workers')return{env};if(name==='@/app/chatgpt-auth')return{getChatGPTUser:async()=>identity};if(name==='@/lib/contracts'||name==='./contracts')return load('lib/contracts.ts');if(name==='@/lib/service')return load('lib/service.ts');return require(name)},crypto:webcrypto,TextEncoder,TextDecoder,URL,Request,Response,Uint8Array,AbortSignal,fetch:provider,btoa,console};vm.runInNewContext(source,sandbox,{filename:file});return cache[file]=module.exports;}
+const contracts=load('lib/contracts.ts'),route=load('app/api/[...path]/route.ts');
+const member={userId:'customer-a',email:'a@example.com',displayName:'Customer A'},owner={userId:'owner',email:'owner@example.com',displayName:'Owner'};
+async function request(url,method='GET',body,headers={}){const r=await route[method](new Request('https://firstcv.test/api/'+url,{method,headers:{...(method==='GET'?{}:{Origin:'https://firstcv.test','Content-Type':'application/json'}),...headers},body:body===undefined?undefined:typeof body==='string'?body:JSON.stringify(body)}));const text=await r.text();let data;try{data=JSON.parse(text)}catch{data=text}return{status:r.status,data,headers:r.headers};}
+(async()=>{
+ assert.equal((await request('orders')).status,401,'anonymous orders denied');
+ identity=member;assert.equal((await request('admin')).status,403,'customer denied admin');
+ assert.equal((await request('orders','POST',{}, {Origin:'https://attacker.test'})).status,403,'cross-origin mutation rejected');
+ assert.equal((await request('resumes','POST',{title:'bad',data:{}})).status,400,'invalid cloud data rejected');
+ const data={version:1,template:'modern',accent:'#5146d9',sample:false,profile:{name:'A',role:'Developer',email:'a@example.com',phone:'',location:'',website:'',summary:''},education:[],experience:[],projects:[],skills:'React',languages:'English',job:''};
+ const saved=await request('resumes','POST',{title:'Private resume',data});assert.equal(saved.status,200);const rid=saved.data.id;
+ identity={...member,userId:'customer-b'};assert.equal((await request('resumes/'+rid)).status,404);await request('resumes/'+rid,'DELETE');identity=member;assert.equal((await request('resumes/'+rid)).status,200,'foreign deletion cannot delete resume');
+ assert.equal((await request('orders','POST',{plan:'review',brief:'A clear description of a target frontend role.',accept:true})).status,503,'closed paid service rejects orders');
+ identity=owner;let c={...contracts.defaults,businessName:'Test Operator',businessAddress:'Test address',supportEmail:'support@example.com',acceptingOrders:true};assert.equal((await request('admin/settings','POST',c)).status,200);
+ identity=member;const made=await request('orders','POST',{plan:'review',brief:'A clear description of a target frontend role.',accept:true,amount:1});assert.equal(made.status,201);const id=made.data.id;
+ assert.equal((await request('orders/'+id)).data.order.amount,29900,'amount comes from server settings');
+ identity={...member,userId:'customer-b'};assert.equal((await request('orders/'+id)).status,404);assert.equal((await request('orders/'+id+'/message','POST',{body:'attack'})).status,404);
+ identity=member;assert.equal((await request('orders/'+id+'/checkout','POST',{})).status,200);assert.equal((await request('orders/'+id+'/checkout','POST',{})).status,200);assert.equal(orderCreates,1,'checkout retry reuses provider order');
+ const good=createHmac('sha256','fixture-secret').update('order_fixture|pay_fixture').digest('hex');
+ assert.equal((await request('orders/'+id+'/verify','POST',{razorpay_order_id:'order_fixture',razorpay_payment_id:'pay_fixture',razorpay_signature:'0'.repeat(64)})).status,400);
+ payment.amount=1;assert.equal((await request('orders/'+id+'/verify','POST',{razorpay_order_id:'order_fixture',razorpay_payment_id:'pay_fixture',razorpay_signature:good})).status,409,'wrong amount rejected');
+ payment.amount=29900;payment.status='authorized';assert.equal((await request('orders/'+id+'/verify','POST',{razorpay_order_id:'order_fixture',razorpay_payment_id:'pay_fixture',razorpay_signature:good})).status,409,'authorization alone is not paid');
+ payment.status='captured';assert.equal((await request('orders/'+id+'/verify','POST',{razorpay_order_id:'order_fixture',razorpay_payment_id:'pay_fixture',razorpay_signature:good})).status,200);assert.equal((await request('orders/'+id)).data.order.status,'paid');
+ assert.equal((await request('orders/'+id+'/status','POST',{status:'in_progress'})).status,403);
+ identity=owner;assert.equal((await request('orders/'+id+'/status','POST',{status:'delivered'})).status,409,'invalid state transition rejected');assert.equal((await request('orders/'+id+'/status','POST',{status:'in_progress'})).status,200);assert.equal((await request('orders/'+id+'/status','POST',{status:'delivered'})).status,409,'cannot deliver without file');
+ assert.equal((await request('orders/'+id+'/file','POST','<html>bad</html>',{'X-File-Name':'test.pdf'})).status,400);
+ assert.equal((await request('orders/'+id+'/file','POST','%PDF-1.7\nfixture',{'X-File-Name':'test.pdf'})).status,200);const file=(await request('orders/'+id)).data.files[0];
+ identity={...member,userId:'customer-b'};assert.equal((await request('files/'+file.id)).status,404,'foreign file denied');identity=member;assert.equal((await request('files/'+file.id)).headers.get('content-disposition'),'attachment; filename="test.pdf"');
+ identity=owner;assert.equal((await request('orders/'+id+'/status','POST',{status:'delivered'})).status,200);
+ const event=JSON.stringify({event:'payment.captured',payload:{payment:{entity:payment}}}),sig=createHmac('sha256','fixture-webhook').update(event).digest('hex');identity=null;assert.equal((await request('webhook','POST',event,{'x-razorpay-signature':'0'.repeat(64)})).status,400);assert.equal((await request('webhook','POST',event,{'x-razorpay-signature':sig})).status,200);identity=member;assert.equal((await request('orders/'+id)).data.order.status,'delivered','replayed webhook preserves delivery state');
+ assert.equal((await request('orders/'+id+'/revision','POST',{})).status,200);assert.equal((await request('orders/'+id+'/revision','POST',{})).status,409,'revision counted once');
+ assert.equal((await request('orders/'+id+'/refund-request','POST',{reason:'I would like cancellation of this order.'})).status,200);assert.equal((await request('orders/'+id)).data.order.payment_status,'captured','refund request is not a confirmed refund');payment.amount_refunded=29900;assert.equal((await request('orders/'+id+'/reconcile','POST',{})).status,200);assert.equal((await request('orders/'+id)).data.order.payment_status,'refunded');
+ await request('resumes/'+rid,'DELETE');assert.equal((await request('resumes/'+rid)).status,404);
+ console.log('PASS: auth, owner authorization, cross-account isolation, CSRF, schema validation, server pricing, idempotent checkout, HMAC and captured-payment verification, file isolation, delivery states, webhook replay, revision limit, provider-confirmed refund and resume deletion.');
+ console.log('Payment API, identity and object storage are simulated; real merchant checkout and browser testing are not covered.');
+})().catch(e=>{console.error(e);process.exitCode=1;});

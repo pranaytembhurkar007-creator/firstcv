@@ -1,0 +1,7 @@
+import {requireChatGPTUser} from '@/app/chatgpt-auth';
+import {ownedOrder,user} from '@/lib/service';
+import {notFound} from 'next/navigation';
+import PrintButton from './print-button';
+export const dynamic='force-dynamic';
+export default async function Receipt({params}:{params:Promise<{id:string}>}){const {id}=await params;return <ReceiptBody id={id}/>;}
+async function ReceiptBody({id}:{id:string}){await requireChatGPTUser('/receipt/'+id);let order;try{order=await ownedOrder(id,await user());}catch{notFound();}if(!order||order.payment_status==='pending')notFound();const snapshot=JSON.parse(order.snapshot);return <main className="receipt-page"><div className="receipt-actions"><a href="/account">← My workspace</a><PrintButton/></div><article className="card receipt"><span className="eyebrow">FIRSTCV</span><h1>Payment receipt</h1><p>{snapshot.businessName}</p><p>{snapshot.businessAddress}</p><hr/><h3>{snapshot.name}</h3><p>Order: {order.id}<br/>Customer: {order.email}<br/>Payment reference: {order.payment_id}</p><h2>{new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR'}).format(order.amount/100)}</h2><p>Status: {order.payment_status==='refunded'?'Fully refunded':'Payment received'}<br/>Order date: {new Date(order.created_at).toLocaleDateString('en-IN')}</p><p>Support: {snapshot.supportEmail}</p><p className="fineprint">This acknowledges the recorded payment status. It is not a GST tax invoice.</p></article></main>;}
